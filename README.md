@@ -44,11 +44,20 @@ export OPENROUTER_API_KEY=<your-key>
 # Run on an FHE challenge
 aide-fhe challenge_dir=fhe_challenge/black_box/challenge_relu
 
-# With custom model and iterations
+# With custom settings
 aide-fhe challenge_dir=fhe_challenge/black_box/challenge_relu \
        agent.steps=30 \
        agent.code.model=gpt-5-mini-2025-08-07 \
-       agent.code.reasoning_effort=high
+       agent.code.temp=0.5 \
+       agent.code.reasoning_effort=high \
+       agent.code.web_search=true \
+       agent.search.num_drafts=10 \
+       agent.search.debug_prob=0.5 \
+       agent.feedback.model=gpt-5-mini-2025-08-07 \
+       agent.feedback.max_lessons=15 \
+       agent.early_stop_threshold=0.99 \
+       exec.build_timeout=600 \
+       exec.run_timeout=1800
 ```
 
 Results are saved to `logs/<run-name>/` including the best solution, journal, and parsed challenge spec.
