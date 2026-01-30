@@ -1,0 +1,41 @@
+# FHE Challenge Configuration
+
+# Path to challenge directory (containing challenge.md)
+challenge_dir: null
+
+# Output directories
+log_dir: logs
+workspace_dir: workspaces
+
+# Experiment name (auto-generated if null)
+exp_name: null
+
+# Execution settings
+exec:
+  build_timeout: 600   # 10 minutes for Docker build
+  run_timeout: 1800    # 30 minutes for FHE computation
+
+# Agent settings
+agent:
+  steps: 50  # Short test run
+  early_stop_threshold: 0.99  # Stop when accuracy reaches this (0.0 to disable)
+
+  # Code generation LLM (draft/improve/debug)
+  code:
+    model: gpt-5-mini-2025-08-07
+    temp: 0.5
+    reasoning_effort: high  # Enable thinking mode: low, medium, high
+    web_search: true  # Enable web search for OpenFHE docs and examples
+
+  # Feedback LLM (lesson extraction from failures)
+  feedback:
+    enabled: true  # Set to false to disable feedback LLM
+    model: gpt-5-mini-2025-08-07  # Cheap model for lesson extraction
+    temp: 0.3
+    max_lessons: 15  # Adjusted for 50 steps
+
+  # Tree search parameters
+  search:
+    num_drafts: 10  # Initial exploration
+    debug_prob: 0.5
+    max_debug_depth: 8
