@@ -19,8 +19,8 @@ Supported challenge types: black-box (pre-encrypted), white-box OpenFHE, ML infe
 ## Installation
 
 ```bash
-git clone https://github.com/your-org/aide-fhe.git
-cd aide-fhe
+git clone https://github.com/yifei-gpt/AIDE-FHE.git
+cd AIDE-FHE
 pip install -e .
 ```
 
@@ -29,6 +29,7 @@ Requires Python 3.10+ and Docker.
 ## Challenge Data
 
 ```bash
+pip install huggingface_hub
 huggingface-cli download yifeiz29/fhe-challenge-data --repo-type dataset --local-dir fhe_challenge
 ```
 
@@ -46,7 +47,7 @@ aide-fhe challenge_dir=fhe_challenge/black_box/challenge_relu
 # With custom model and iterations
 aide-fhe challenge_dir=fhe_challenge/black_box/challenge_relu \
        agent.steps=30 \
-       agent.code.model=deepseek/deepseek-v3.2 \
+       agent.code.model=gpt-5-mini-2025-08-07 \
        agent.code.reasoning_effort=high
 ```
 
