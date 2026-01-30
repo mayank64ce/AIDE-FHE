@@ -14,7 +14,7 @@ The agent operates as a tree-search over the space of FHE solutions:
 4. **Evaluate** results by parsing validator output (accuracy, errors, score)
 5. **Improve or debug** based on feedback, branching the solution tree
 
-Supported challenge types: black-box (pre-encrypted), white-box OpenFHE, ML inference, and non-OpenFHE (HElayers, SEAL, etc.).
+Supported challenge types: black-box (pre-encrypted), white-box OpenFHE, and ML inference.
 
 ## Installation
 
