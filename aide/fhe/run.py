@@ -22,7 +22,6 @@ Architecture:
 import atexit
 import logging
 import shutil
-from pathlib import Path
 
 from omegaconf import OmegaConf
 from rich.columns import Columns
@@ -130,8 +129,9 @@ def _aggregate_results(results: list) -> object:
     if valid_validations:
         # Minimum accuracy across all testcases
         min_accuracy = min(v.accuracy for v in valid_validations)
-        max_error = max((v.max_error for v in valid_validations if v.max_error), default=None)
-        mean_error = sum(v.mean_error for v in valid_validations if v.mean_error) / len(valid_validations) if valid_validations else None
+        max_error = max((v.max_error for v in valid_validations if v.max_error is not None), default=None)
+        mean_errors = [v.mean_error for v in valid_validations if v.mean_error is not None]
+        mean_error = sum(mean_errors) / len(mean_errors) if mean_errors else None
         validation = AggregatedValidation(min_accuracy, max_error, mean_error)
     else:
         validation = AggregatedValidation(None, None, None)
@@ -436,7 +436,8 @@ def print_summary(cfg: FHEConfig, journal: Journal, spec):
     if best_node:
         print(f"\nBest solution:")
         print(f"  Accuracy: {best_node.metric.value:.4f}")
-        print(f"  Plan: {best_node.plan[:200]}..." if len(best_node.plan) > 200 else f"  Plan: {best_node.plan}")
+        plan_text = best_node.plan or ""
+        print(f"  Plan: {plan_text[:200]}..." if len(plan_text) > 200 else f"  Plan: {plan_text}")
 
     print(f"\nOutput files:")
     print(f"  Journal: {cfg.log_dir / 'journal.json'}")

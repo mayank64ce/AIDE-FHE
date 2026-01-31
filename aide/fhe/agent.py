@@ -138,6 +138,11 @@ class FHEAgent:
                 path = self.spec.template_dir / name
                 if path.exists():
                     context[name] = path.read_text()
+            # Swift templates store main.swift in Sources/ subdirectory
+            if "main.swift" not in context:
+                swift_main = self.spec.template_dir / "Sources" / "main.swift"
+                if swift_main.exists():
+                    context["main.swift"] = swift_main.read_text()
 
         return context
 
@@ -167,6 +172,10 @@ class FHEAgent:
         # Check for Python templates first
         if self._is_python_template():
             return self._extract_python_template_variables()
+
+        # Check for Swift templates
+        if self.spec.library == Library.SWIFT_HE:
+            return self._extract_swift_template_variables()
 
         # C++ template extraction (default)
         result = {
@@ -307,8 +316,49 @@ class FHEAgent:
 
         return result
 
+    def _extract_swift_template_variables(self) -> dict[str, list[str]]:
+        """Extract variables from Swift template files."""
+        import re
+
+        result = {
+            'context': 'context',
+            'inputs': ['cipher1'],
+            'output': 'result',
+            'public_key': 'evaluationKey',
+            'is_swift': True,
+            'is_python': False,
+        }
+
+        swift_content = self._template_context.get('main.swift', '')
+        if not swift_content:
+            return result
+
+        # Extract input variable names from CLI argument loading
+        # Pattern: let varName = try loadCiphertext(path: argName, ...)
+        load_pattern = r'let\s+(\w+)\s*=\s*try\s+loadCiphertext\('
+        inputs = re.findall(load_pattern, swift_content)
+        if inputs:
+            result['inputs'] = inputs
+
+        # Extract evaluation key variable
+        eval_key_pattern = r'let\s+(\w+)\s*=\s*try\s+loadEvaluationKey\('
+        ek_match = re.search(eval_key_pattern, swift_content)
+        if ek_match:
+            result['public_key'] = ek_match.group(1)
+
+        # Extract context variable
+        ctx_pattern = r'let\s+(\w+)\s*=\s*try\s+Context\('
+        ctx_match = re.search(ctx_pattern, swift_content)
+        if ctx_match:
+            result['context'] = ctx_match.group(1)
+
+        return result
+
     def _format_variable_docs(self, vars: dict) -> list[str]:
         """Format variable documentation for prompts."""
+        # Check if Swift template
+        if vars.get('is_swift', False):
+            return self._format_swift_variable_docs(vars)
         # Check if Python template
         if vars.get('is_python', False):
             return self._format_python_variable_docs(vars)
@@ -337,6 +387,32 @@ class FHEAgent:
             "  return result;       // WRONG - eval() is void!",
         ])
 
+        return lines
+
+    def _format_swift_variable_docs(self, vars: dict) -> list[str]:
+        """Format variable documentation for Swift templates."""
+        lines = [
+            "IMPORTANT - Use these EXACT variable names (already loaded in template):",
+            f"  {vars['context']}       - BFV Context for encryption parameters",
+        ]
+        for inp in vars['inputs']:
+            lines.append(f"  {inp}        - Input encrypted ciphertext (CanonicalCiphertext)")
+        lines.extend([
+            f"  {vars['public_key']} - EvaluationKey (for rotation + relinearization)",
+            "",
+            "Available operations (Swift operators):",
+            "  cipher1 + cipher2           // Add ciphertexts",
+            "  cipher1 - cipher2           // Subtract ciphertexts",
+            "  cipher1 * cipher2           // Multiply ciphertexts",
+            "  cipher1 + plaintext         // Add plaintext",
+            "  cipher1 * plaintext         // Multiply by plaintext",
+            "  -cipher1                    // Negation",
+            f"  cipher.rotateColumns(by: step, using: {vars['public_key']})  // Rotate slots",
+            f"  cipher.relinearize(using: {vars['public_key']})              // After multiplication",
+            "  context.encode(values: [UInt64], format: .coefficient)        // Create plaintext",
+            "",
+            f"Assign your result to 'result' variable (already declared as 'var result = ...').",
+        ])
         return lines
 
     def _format_python_variable_docs(self, vars: dict) -> list[str]:

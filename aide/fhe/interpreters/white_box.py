@@ -88,62 +88,6 @@ class WhiteBoxInterpreter(BaseInterpreter):
             # No template - create solution.cpp
             (self.app_build_dir / "solution.cpp").write_text(actual_code)
 
-    def _parse_code_with_config(self, code: str) -> tuple[str | None, str]:
-        """
-        Parse code that may contain CONFIG and CODE sections.
-
-        Returns:
-            (config_json, actual_code) - config_json is the raw JSON string, None if no CONFIG section
-        """
-        config_json = None
-        actual_code = code
-
-        # Check for ### CONFIG ### section
-        if '### CONFIG ###' in code:
-            parts = code.split('### CONFIG ###', 1)
-            if len(parts) > 1:
-                rest = parts[1]
-                # Find where code section starts
-                if '### CODE ###' in rest:
-                    config_part, code_part = rest.split('### CODE ###', 1)
-                    actual_code = code_part.strip()
-                    config_json = config_part.strip()
-                else:
-                    # No explicit CODE marker - extract JSON block, rest is code
-                    lines = rest.strip().split('\n')
-                    config_lines = []
-                    code_start = 0
-                    in_json = False
-                    brace_count = 0
-
-                    for i, line in enumerate(lines):
-                        if '{' in line:
-                            in_json = True
-                        if in_json:
-                            config_lines.append(line)
-                            brace_count += line.count('{') - line.count('}')
-                            if brace_count <= 0:
-                                code_start = i + 1
-                                break
-
-                    config_json = '\n'.join(config_lines)
-                    actual_code = '\n'.join(lines[code_start:]).strip()
-
-                # Validate JSON
-                if config_json:
-                    try:
-                        parsed = json.loads(config_json)
-                        logger.info(f"Parsed config with keys: {list(parsed.keys())}")
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Invalid config JSON: {e}")
-                        config_json = None
-
-        elif '### CODE ###' in code:
-            # Just CODE section, no config
-            actual_code = code.split('### CODE ###', 1)[1].strip()
-
-        return config_json, actual_code
-
     def _write_config(self, config_json: str) -> None:
         """
         Write config.json file (complete replacement).
@@ -334,16 +278,25 @@ class WhiteBoxInterpreter(BaseInterpreter):
         result = ExecutionResult()
         start_time = time.time()
 
-        # Validate format: white-box requires config.json
+        # If no CONFIG section provided, use template's default config.json
         if "### CONFIG ###" not in code:
-            result.build_success = False
-            result.error_type = "FORMAT_ERROR"
-            result.error_message = (
-                "Missing ### CONFIG ### section. "
-                "White-box challenges require both config.json and code."
-            )
-            result.total_time = time.time() - start_time
-            return result
+            # Read default config from template directory
+            default_config = None
+            if self.spec.template_dir:
+                config_file = self.spec.template_dir / "config.json"
+                if config_file.exists():
+                    default_config = config_file.read_text()
+            if default_config:
+                code = f"### CONFIG ###\n{default_config}\n\n### CODE ###\n{code}"
+                logger.info("No CONFIG section in LLM output - using template default config.json")
+            else:
+                result.build_success = False
+                result.error_type = "FORMAT_ERROR"
+                result.error_message = (
+                    "Missing ### CONFIG ### section and no default config.json in template."
+                )
+                result.total_time = time.time() - start_time
+                return result
 
         try:
             # Prepare source
@@ -384,9 +337,23 @@ class WhiteBoxInterpreter(BaseInterpreter):
                     result.build_output = run_out  # Use actual fherma output, not "Build files prepared"
                     self._analyze_build_error(result)
                 else:
-                    # Runtime error
+                    # Runtime error or timeout
                     result.run_success = False
                     self._analyze_runtime_error(result)
+
+                # Even on timeout/error, check for partial result.json
+                # fherma-validator may have written results before being killed
+                result_file = self.app_build_dir / "result.json"
+                if result_file.exists():
+                    logger.info("Found result.json despite run failure - checking partial results")
+                    result.output_generated = True
+                    result.output_path = result_file
+                    result.validation = self.validate(result_file, testcase_path)
+                    # If we got valid results, mark run as successful despite timeout
+                    if result.validation and result.validation.accuracy is not None:
+                        result.run_success = True
+                        logger.info(f"Partial results valid: accuracy={result.validation.accuracy:.4f}")
+
                 result.total_time = time.time() - start_time
                 return result
 

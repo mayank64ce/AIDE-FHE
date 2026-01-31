@@ -1,4 +1,4 @@
-from . import backend_openai, backend_openrouter
+from . import backend_openai, backend_openrouter, backend_vllm
 from .utils import FunctionSpec, OutputType, PromptType, compile_prompt_to_md
 import re
 import logging
@@ -8,6 +8,9 @@ logger = logging.getLogger("aide")
 
 
 def determine_provider(model: str) -> str:
+    # vLLM local models: "vllm/Qwen/Qwen3-4B-Instruct-2507" etc.
+    if model.startswith("vllm/"):
+        return "vllm"
     # Check if model matches OpenAI patterns first
     if re.match(r"^(gpt-.*|o\d+(-.*)?|codex-mini-latest)$", model):
         return "openai"
@@ -22,6 +25,7 @@ def determine_provider(model: str) -> str:
 provider_to_query_func = {
     "openai": backend_openai.query,
     "openrouter": backend_openrouter.query,
+    "vllm": backend_vllm.query,
 }
 
 

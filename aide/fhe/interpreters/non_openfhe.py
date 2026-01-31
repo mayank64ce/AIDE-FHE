@@ -53,20 +53,20 @@ class NonOpenFHEInterpreter(BaseInterpreter):
         # Store code for later injection (used by verify.sh flow)
         self._pending_code = actual_code
 
-        # Clear previous build - use subprocess to handle Docker-created files
+        # Clear previous build - use Docker to handle root-owned artifacts
         if self.app_build_dir.exists():
             # First try normal cleanup
             shutil.rmtree(self.app_build_dir, ignore_errors=True)
-            # If .build directory still exists (Docker artifacts), force remove with sudo
-            build_dir = self.app_build_dir / ".build"
-            if build_dir.exists():
+            # If .build or other root-owned dirs still exist, use Docker to clean
+            if self.app_build_dir.exists():
                 try:
-                    subprocess.run(["sudo", "rm", "-rf", str(build_dir)],
-                                   capture_output=True, timeout=30)
+                    subprocess.run(
+                        ["docker", "run", "--rm",
+                         "-v", f"{self.app_build_dir}:/cleanup",
+                         "alpine", "rm", "-rf", "/cleanup/.build", "/cleanup/.swiftpm"],
+                        capture_output=True, timeout=60)
                 except Exception:
                     pass
-            # Final cleanup
-            if self.app_build_dir.exists():
                 shutil.rmtree(self.app_build_dir, ignore_errors=True)
         self.app_build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -91,58 +91,6 @@ class NonOpenFHEInterpreter(BaseInterpreter):
             self._inject_helayers_code(actual_code)
         elif self.spec.library == Library.SWIFT_HE:
             self._inject_swift_code(actual_code)
-
-    def _parse_code_with_config(self, code: str) -> tuple[str | None, str]:
-        """Parse code that may contain CONFIG and CODE sections.
-
-        Returns:
-            (config_json, actual_code) - config_json is the raw JSON string, None if no CONFIG section
-        """
-        config_json = None
-        actual_code = code
-
-        if '### CONFIG ###' in code:
-            parts = code.split('### CONFIG ###', 1)
-            if len(parts) > 1:
-                rest = parts[1]
-                if '### CODE ###' in rest:
-                    config_part, code_part = rest.split('### CODE ###', 1)
-                    actual_code = code_part.strip()
-                    config_json = config_part.strip()
-                else:
-                    # Extract JSON block
-                    lines = rest.strip().split('\n')
-                    config_lines = []
-                    code_start = 0
-                    brace_count = 0
-                    in_json = False
-
-                    for i, line in enumerate(lines):
-                        if '{' in line:
-                            in_json = True
-                        if in_json:
-                            config_lines.append(line)
-                            brace_count += line.count('{') - line.count('}')
-                            if brace_count <= 0:
-                                code_start = i + 1
-                                break
-
-                    config_json = '\n'.join(config_lines)
-                    actual_code = '\n'.join(lines[code_start:]).strip()
-
-                # Validate JSON
-                if config_json:
-                    try:
-                        parsed = json.loads(config_json)
-                        logger.info(f"Parsed config with keys: {list(parsed.keys())}")
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Invalid config JSON: {e}")
-                        config_json = None
-
-        elif '### CODE ###' in code:
-            actual_code = code.split('### CODE ###', 1)[1].strip()
-
-        return config_json, actual_code
 
     def _write_config(self, config_json: str) -> None:
         """Write config.json file (complete replacement)."""
@@ -282,31 +230,6 @@ class NonOpenFHEInterpreter(BaseInterpreter):
         logger.warning("Swift: Could not find injection point, replacing file")
         solution_file.write_text(code)
 
-    def _inject_swift_code_to_file(self, file_path: Path, code: str) -> None:
-        """Inject code into a specific Swift file."""
-        if not file_path.exists():
-            file_path.write_text(code)
-            return
-
-        template = file_path.read_text()
-
-        # Pattern: func solve(...) { placeholder }
-        pattern = r'(func\s+solve\s*\([^)]*\)\s*(?:throws\s*)?(?:->\s*\[[^\]]+\]\s*)?\{)\s*\n\s*(?:return\s+\[\]|fatalError\([^)]*\))'
-        if re.search(pattern, template):
-            new_content = re.sub(pattern, rf'\1\n{code}', template)
-            file_path.write_text(new_content)
-            return
-
-        # Pattern: // Your implementation
-        pattern = r'//\s*[Yy]our\s+implementation[^\n]*\n'
-        if re.search(pattern, template):
-            new_content = re.sub(pattern, f'{code}\n', template)
-            file_path.write_text(new_content)
-            return
-
-        # Fallback
-        file_path.write_text(code)
-
     def build(self) -> tuple[bool, list]:
         """Build using challenge's Dockerfile."""
         # Copy Dockerfile and other build files
@@ -346,7 +269,8 @@ class NonOpenFHEInterpreter(BaseInterpreter):
             shutil.copy2(verify_sh, self.workspace_dir / "verify.sh")
 
             # Copy templates directory if exists (needed by verify.sh)
-            # IMPORTANT: Inject code and config into templates BEFORE verify.sh copies them
+            # IMPORTANT: verify.sh wipes app_build/ and copies from templates/,
+            # so we must propagate injected code from app_build/ back to templates/
             templates_src = self.spec.challenge_dir / "templates"
             if templates_src.exists():
                 templates_dst = self.workspace_dir / "templates"
@@ -354,23 +278,30 @@ class NonOpenFHEInterpreter(BaseInterpreter):
                     shutil.rmtree(templates_dst, ignore_errors=True)
                 shutil.copytree(templates_src, templates_dst)
 
-                # Inject code into the template (verify.sh will copy this to app_build)
+                # Propagate injected code + config from app_build/ to templates/
+                # (_prepare_source() already injected code into app_build/)
                 if self.spec.library == Library.SWIFT_HE:
-                    swift_main = templates_dst / "swift" / "Sources" / "main.swift"
-                    if swift_main.exists() and hasattr(self, '_pending_code'):
-                        self._inject_swift_code_to_file(swift_main, self._pending_code)
-
-                    # Copy modified config.json from app_build to templates
-                    # (verify.sh copies templates/swift/* to app_build/)
-                    config_src = self.app_build_dir / "config.json"
-                    config_dst = templates_dst / "swift" / "config.json"
-                    if config_src.exists():
-                        shutil.copy2(config_src, config_dst)
-                        logger.info(f"Copied modified config.json to templates/swift/")
+                    # Copy injected main.swift from app_build to templates
+                    for src_rel in ["Sources/main.swift", "config.json"]:
+                        src = self.app_build_dir / src_rel
+                        dst = templates_dst / "swift" / src_rel
+                        if src.exists():
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(src, dst)
+                            logger.info(f"Propagated {src_rel} to templates/swift/")
 
                     # Add .dockerignore to templates to prevent build artifacts
                     dockerignore = templates_dst / "swift" / ".dockerignore"
                     dockerignore.write_text(".build\n.swiftpm\n*.o\n*.d\n")
+
+                elif self.spec.library == Library.HELAYERS:
+                    # Copy injected app.py and config from app_build to templates
+                    for filename in ["app.py", "config.json"]:
+                        src = self.app_build_dir / filename
+                        dst = templates_dst / "helayers" / filename
+                        if src.exists():
+                            shutil.copy2(src, dst)
+                            logger.info(f"Propagated {filename} to templates/helayers/")
 
             # Copy tests directory if exists (needed by verify.sh)
             tests_src = self.spec.challenge_dir / "tests"
@@ -388,10 +319,23 @@ class NonOpenFHEInterpreter(BaseInterpreter):
                     shutil.rmtree(validator_dst, ignore_errors=True)
                 shutil.copytree(validator_src, validator_dst)
 
-            # Copy Dockerfile if exists (needed for building validator)
-            dockerfile_src = self.spec.challenge_dir / "Dockerfile"
-            if dockerfile_src.exists():
-                shutil.copy2(dockerfile_src, self.workspace_dir / "Dockerfile")
+            # Copy build/validation files from challenge dir to workspace
+            for filename in ["Dockerfile", "validator.py"]:
+                src = self.spec.challenge_dir / filename
+                if src.exists():
+                    shutil.copy2(src, self.workspace_dir / filename)
+
+            # Patch verify.sh to ensure Docker-created files are writable
+            # verify.sh recreates app_build/ from templates, but Docker
+            # containers may run as different users and need write access
+            verify_content = (self.workspace_dir / "verify.sh").read_text()
+            if "chmod -R a+rw" not in verify_content:
+                # Add chmod after app_build preparation (before Docker run)
+                verify_content = verify_content.replace(
+                    'echo "=== Running',
+                    'chmod -R a+rw "$SCRIPT_DIR" 2>/dev/null || true\necho "=== Running'
+                )
+                (self.workspace_dir / "verify.sh").write_text(verify_content)
 
             # Run verify.sh
             try:
@@ -473,31 +417,54 @@ class NonOpenFHEInterpreter(BaseInterpreter):
             # Prepare source
             self._prepare_source(code)
 
-            # Build
-            build_start = time.time()
-            build_ok, build_out = self.build()
-            result.build_time = time.time() - build_start
-            result.build_success = build_ok
-            result.build_output = build_out
+            # Check if verify.sh handles build+run (skip separate build step)
+            verify_sh = self.spec.challenge_dir / "verify.sh"
+            has_verify_sh = verify_sh.exists()
 
-            if not build_ok:
-                self._analyze_build_error(result)
-                result.total_time = time.time() - start_time
-                return result
+            if not has_verify_sh:
+                # Build separately only when no verify.sh
+                build_start = time.time()
+                build_ok, build_out = self.build()
+                result.build_time = time.time() - build_start
+                result.build_success = build_ok
+                result.build_output = build_out
 
-            # Run
+                if not build_ok:
+                    self._analyze_build_error(result)
+                    result.total_time = time.time() - start_time
+                    return result
+            else:
+                # verify.sh handles build internally
+                result.build_success = True
+                result.build_output = ["Build handled by verify.sh"]
+
+            # Run (uses verify.sh if available, otherwise Docker directly)
             run_start = time.time()
             run_ok, run_out = self.run(testcase_path)
             result.run_time = time.time() - run_start
             result.run_output = run_out
 
-            # Check for runtime errors in output (some commands return 0 on crash)
+            # Check for errors in output
             output_text = "\n".join(run_out) if isinstance(run_out, list) else str(run_out)
-            has_runtime_error = self._has_runtime_error(output_text)
 
-            if not run_ok or has_runtime_error:
-                result.run_success = False
-                self._analyze_runtime_error(result)
+            if not run_ok or self._has_runtime_error(output_text):
+                # When verify.sh handles build+run, detect if failure is build or runtime
+                if has_verify_sh and self._is_build_error(output_text):
+                    result.build_success = False
+                    result.build_output = run_out
+                    self._analyze_build_error(result)
+                else:
+                    result.run_success = False
+                    self._analyze_runtime_error(result)
+
+                # Check for partial result.json (validator may have written it)
+                result_file = self.app_build_dir / "result.json"
+                if not result_file.exists():
+                    result_file = self.workspace_dir / "result.json"
+                if result_file.exists():
+                    result.output_generated = True
+                    result.validation = self.validate(result_file, testcase_path)
+
                 result.total_time = time.time() - start_time
                 return result
 
@@ -528,10 +495,10 @@ class NonOpenFHEInterpreter(BaseInterpreter):
         output_lower = output.lower()
 
         # Common runtime error patterns for HElayers and Swift
+        # NOTE: Patterns must be specific enough to avoid false positives
+        # on normal output (e.g., "Error rate: 0.01" or "Errors: 0")
         runtime_patterns = [
-            "error:",
-            "exception:",
-            "traceback",
+            "traceback (most recent call last)",
             "fatal error",
             "segmentation fault",
             "aborted",
@@ -539,9 +506,62 @@ class NonOpenFHEInterpreter(BaseInterpreter):
             "panic:",  # Swift
             "fatalerror",  # Swift
             "assertion failed",
+            "exception:",
+            "terminate called",
         ]
 
         for pattern in runtime_patterns:
+            if pattern in output_lower:
+                return True
+
+        # Check for Python exception patterns (NameError:, ValueError:, etc.)
+        # but NOT "error:" alone (too broad - matches "Error rate: 0.0")
+        if re.search(r'\w+Error:', output) or re.search(r'\w+Exception:', output):
+            return True
+
+        return False
+
+    def _is_build_error(self, output: str) -> bool:
+        """Detect if verify.sh output indicates a build/compilation error."""
+        output_lower = output.lower()
+
+        # Swift build error patterns
+        swift_build_patterns = [
+            "swift build",  # Swift build command failed
+            "compiling ",  # Swift compilation output
+            "error: no such module",
+            "cannot find type",
+            "cannot find '",
+            "use of unresolved identifier",
+            "value of type",
+            "expected declaration",
+            "linker command failed",
+        ]
+        for pattern in swift_build_patterns:
+            if pattern in output_lower:
+                # Verify it's actually a build failure (not just mentioning "swift build")
+                if "error:" in output_lower or "fatal:" in output_lower:
+                    return True
+
+        # Docker build error patterns
+        docker_build_patterns = [
+            "error building image",
+            "dockerfile parse error",
+            "error checking context",
+        ]
+        for pattern in docker_build_patterns:
+            if pattern in output_lower:
+                return True
+
+        # CMake/make patterns (for C++ challenges)
+        cmake_patterns = [
+            "cmake error",
+            "make[",
+            "undefined reference",
+            "fatal error:",
+            "collect2: error",
+        ]
+        for pattern in cmake_patterns:
             if pattern in output_lower:
                 return True
 

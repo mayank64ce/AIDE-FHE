@@ -70,11 +70,6 @@ class ExecutionResult(DataClassJsonMixin):
     app_build_dir: Optional[Path] = None
 
     @property
-    def success(self) -> bool:
-        """True if build and run succeeded."""
-        return self.build_success and self.run_success
-
-    @property
     def accuracy(self) -> Optional[float]:
         """Accuracy from validation, if available."""
         if self.validation:
@@ -323,6 +318,64 @@ class BaseInterpreter(ABC):
         # Fallback: Replace entire file
         logger.warning("Could not find injection point, replacing entire file")
         solution_file.write_text(code)
+
+    def _parse_code_with_config(self, code: str) -> tuple[str | None, str]:
+        """
+        Parse code that may contain CONFIG and CODE sections.
+
+        Returns:
+            (config_json, actual_code) - config_json is the raw JSON string, None if no CONFIG section
+        """
+        import json
+
+        config_json = None
+        actual_code = code
+
+        # Check for ### CONFIG ### section
+        if '### CONFIG ###' in code:
+            parts = code.split('### CONFIG ###', 1)
+            if len(parts) > 1:
+                rest = parts[1]
+                # Find where code section starts
+                if '### CODE ###' in rest:
+                    config_part, code_part = rest.split('### CODE ###', 1)
+                    actual_code = code_part.strip()
+                    config_json = config_part.strip()
+                else:
+                    # No explicit CODE marker - extract JSON block, rest is code
+                    lines = rest.strip().split('\n')
+                    config_lines = []
+                    code_start = 0
+                    in_json = False
+                    brace_count = 0
+
+                    for i, line in enumerate(lines):
+                        if '{' in line:
+                            in_json = True
+                        if in_json:
+                            config_lines.append(line)
+                            brace_count += line.count('{') - line.count('}')
+                            if brace_count <= 0:
+                                code_start = i + 1
+                                break
+
+                    config_json = '\n'.join(config_lines)
+                    actual_code = '\n'.join(lines[code_start:]).strip()
+
+                # Validate JSON
+                if config_json:
+                    try:
+                        parsed = json.loads(config_json)
+                        logger.info(f"Parsed config with keys: {list(parsed.keys())}")
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Invalid config JSON: {e}")
+                        config_json = None
+
+        elif '### CODE ###' in code:
+            # Just CODE section, no config
+            actual_code = code.split('### CODE ###', 1)[1].strip()
+
+        return config_json, actual_code
 
     def _strip_eval_wrapper(self, code: str) -> str:
         """Strip void eval() { } wrapper if LLM included it."""

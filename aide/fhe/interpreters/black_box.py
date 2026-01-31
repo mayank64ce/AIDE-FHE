@@ -39,7 +39,6 @@ class BlackBoxInterpreter(BaseInterpreter):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.image_name = f"fhe-black-box-{self.spec.task}"
-        self.current_testcase: Optional[Path] = None
 
     def _prepare_source(self, code: str) -> None:
         """
@@ -105,8 +104,6 @@ class BlackBoxInterpreter(BaseInterpreter):
             else:
                 return False, ["ERROR: No testcase available"]
 
-        self.current_testcase = testcase_path
-
         # Clean up any stale output.txt that might have been created by previous
         # runs (could be owned by root from Docker, preventing overwrites)
         output_file = testcase_path / "output.txt"
@@ -114,9 +111,15 @@ class BlackBoxInterpreter(BaseInterpreter):
             try:
                 output_file.unlink()
             except PermissionError:
-                # If we can't delete it, try via sudo (won't work in most cases)
-                subprocess.run(["sudo", "rm", "-f", str(output_file)],
-                             capture_output=True, timeout=5)
+                # Use Docker to remove root-owned files
+                try:
+                    subprocess.run(
+                        ["docker", "run", "--rm",
+                         "-v", f"{testcase_path}:/cleanup",
+                         "alpine", "rm", "-f", "/cleanup/output.txt"],
+                        capture_output=True, timeout=30)
+                except Exception:
+                    pass
 
         # Run with testcase mounted at /data
         return self.run_docker(
@@ -162,12 +165,32 @@ class BlackBoxInterpreter(BaseInterpreter):
             logger.info(f"BlackBox run_ok={run_ok}, has_runtime_error={has_runtime_error}")
 
             if not run_ok or has_runtime_error:
-                result.run_success = False
-                self._analyze_runtime_error(result)
-                result.total_time = time.time() - start_time
-                return result
+                if has_runtime_error:
+                    # Genuine runtime error (crash, exception)
+                    result.run_success = False
+                    self._analyze_runtime_error(result)
+                    result.total_time = time.time() - start_time
+                    return result
 
-            result.run_success = True
+                # run_ok=False but no runtime error detected in output.
+                # The verifier may have returned non-zero due to low accuracy
+                # (not a crash). Check if verifier output contains metrics.
+                has_verifier_output = bool(
+                    re.search(r'(?:accuracy|slots?\s+passed|total\s+score)', output_text, re.IGNORECASE)
+                )
+                if has_verifier_output:
+                    # Verifier ran successfully but solution had low accuracy.
+                    # Parse metrics and treat as a successful run with poor results.
+                    logger.info("Verifier returned non-zero but produced metrics - parsing results")
+                    result.run_success = True
+                else:
+                    # No verifier output - genuine run failure
+                    result.run_success = False
+                    self._analyze_runtime_error(result)
+                    result.total_time = time.time() - start_time
+                    return result
+            else:
+                result.run_success = True
 
             # Check for output and validate
             if testcase_path is None and self.spec.testcase_dirs:
@@ -227,7 +250,7 @@ class BlackBoxInterpreter(BaseInterpreter):
             if result.accuracy > 1:
                 result.accuracy /= 100  # Handle percentage
 
-        # Parse slots
+        # Parse slots - handle "Slots passed: 3800/4096" and "Correct slots: 3800" + "Total slots: 4096"
         slots_match = re.search(r'[Ss]lots\s+passed[:\s]+(\d+)/(\d+)', output_text)
         if slots_match:
             passed = int(slots_match.group(1))
@@ -235,14 +258,22 @@ class BlackBoxInterpreter(BaseInterpreter):
             result.total_slots = total
             if result.accuracy is None:
                 result.accuracy = passed / total
+        else:
+            # Try separate "Total slots" and "Correct slots" fields
+            total_match = re.search(r'[Tt]otal\s+slots[:\s]+(\d+)', output_text)
+            correct_match = re.search(r'[Cc]orrect\s+slots[:\s]+(\d+)', output_text)
+            if total_match:
+                result.total_slots = int(total_match.group(1))
+            if correct_match and total_match and result.accuracy is None:
+                result.accuracy = int(correct_match.group(1)) / int(total_match.group(1))
 
         # Parse fatal errors
         fatal_match = re.search(r'[Ff]atal\s+errors?[:\s]+(\d+)', output_text)
         if fatal_match:
             result.fatal_error_count = int(fatal_match.group(1))
 
-        # Parse mean/max error
-        mean_match = re.search(r'[Mm]ean\s+error[:\s]+(\d+\.?\d*)', output_text)
+        # Parse mean/max error (handle both "Mean error" and "Average error")
+        mean_match = re.search(r'(?:[Mm]ean|[Aa]verage)\s+error[:\s]+(\d+\.?\d*)', output_text)
         if mean_match:
             result.mean_error = float(mean_match.group(1))
 

@@ -10,6 +10,7 @@ Stage 2: Inference (Encrypted)
 - System runs fherma-validator for encrypted inference
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -235,6 +236,7 @@ class MLInferenceInterpreter(WhiteBoxInterpreter):
         # Track training state
         self.training_completed = False
         self.trained_weights_path: Optional[Path] = None
+        self._last_training_hash: Optional[str] = None
 
         # Load training data on init
         self._load_training_data()
@@ -254,69 +256,6 @@ class MLInferenceInterpreter(WhiteBoxInterpreter):
         self.training_data = TrainingDataLoader.load(data_dir)
         if self.training_data:
             logger.info(f"Loaded training data: {self.training_data.X_shape}")
-
-    def get_training_data_path(self) -> Path:
-        """Return path to training data directory."""
-        return self.spec.challenge_dir / "data"
-
-    def get_training_data_summary(self) -> str:
-        """Generate summary for agent prompt."""
-        if self.training_data is None:
-            return "No training data found."
-        return self.training_data.summary()
-
-    def get_data_loading_code(self) -> str:
-        """Generate code snippet for loading training data."""
-        data_dir = self.get_training_data_path()
-
-        if self.training_data is None:
-            return "# No training data available"
-
-        if self.training_data.data_format == "numpy":
-            # Check actual file names (prefer flat/pre-processed versions first)
-            x_file = "X_train.npy"
-            for name in ["X_train_flat.npy", "X_train.npy", "x_train.npy"]:
-                if (data_dir / name).exists():
-                    x_file = name
-                    break
-            y_file = "y_train.npy"
-            for name in ["y_train.npy", "Y_train.npy"]:
-                if (data_dir / name).exists():
-                    y_file = name
-                    break
-
-            return f'''import numpy as np
-
-# Load training data
-X_train = np.load("{data_dir}/{x_file}")
-y_train = np.load("{data_dir}/{y_file}")
-print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
-'''
-
-        elif self.training_data.data_format == "csv":
-            return f'''import pandas as pd
-import numpy as np
-
-# Load training data
-X_train = pd.read_csv("{data_dir}/X_train.csv").values
-y_train = pd.read_csv("{data_dir}/y_train.csv").values.flatten()
-print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
-'''
-
-        elif self.training_data.data_format == "parquet":
-            parquet_files = list(data_dir.glob("*.parquet"))
-            if parquet_files:
-                return f'''import pandas as pd
-import numpy as np
-
-# Load training data
-df = pd.read_parquet("{parquet_files[0]}")
-X_train = np.stack(df["embedding"].values)  # 768-dim embeddings
-y_train = df["label"].values  # 0=negative, 1=neutral, 2=positive
-print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
-'''
-
-        return "# Unknown data format"
 
     def validate(self, output_path: Path, testcase_path: Path) -> "ValidationResult":
         """
@@ -483,6 +422,17 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
         config_match = re.search(config_pattern, code, re.DOTALL | re.IGNORECASE)
         if config_match:
             config_json = config_match.group(1).strip()
+            # Strip markdown separators that LLMs insert between sections
+            config_json = re.sub(r'\n-{3,}\s*$', '', config_json).strip()
+            # Extract just the JSON object if LLM appended explanation text after it
+            if config_json.startswith('{'):
+                brace_depth = 0
+                for i, ch in enumerate(config_json):
+                    if ch == '{': brace_depth += 1
+                    elif ch == '}': brace_depth -= 1
+                    if brace_depth == 0 and ch == '}':
+                        config_json = config_json[:i+1]
+                        break
 
         # Pattern 1: Look for explicit markers
         training_pattern = r'###\s*TRAINING\s+CODE\s*###\s*\n(.*?)(?=###\s*INFERENCE|$)'
@@ -493,27 +443,41 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
 
         if training_match:
             training_code = training_match.group(1).strip()
+            # Strip markdown separators (e.g., "---") that LLMs insert between sections
+            training_code = re.sub(r'^-{3,}\s*\n', '', training_code)
+            training_code = re.sub(r'\n-{3,}\s*$', '', training_code).strip()
         if inference_match:
             inference_code = inference_match.group(1).strip()
+            inference_code = re.sub(r'^-{3,}\s*\n', '', inference_code)
+            inference_code = re.sub(r'\n-{3,}\s*$', '', inference_code).strip()
 
         # Pattern 2: Look for code blocks with markers in comments
         if not training_code or not inference_code:
-            # Find all code blocks
-            code_blocks = re.findall(r'```(?:python)?\n(.*?)```', code, re.DOTALL)
+            # Find all code blocks (any language tag)
+            code_blocks = re.findall(r'```(?:\w+)?\n(.*?)```', code, re.DOTALL)
 
             for block in code_blocks:
                 block_lower = block.lower()
-                if 'training' in block_lower[:200] or 'train' in block_lower[:100]:
+                # Check first few lines for training markers (not just substring)
+                header = block_lower[:200]
+                if '### training' in header or 'training code' in header or '# train' in header[:80]:
                     if not training_code:
                         training_code = block.strip()
-                elif 'inference' in block_lower[:200] or 'solve' in block_lower[:100]:
+                elif '### inference' in header or 'inference code' in header or 'def solve' in block_lower[:150]:
                     if not inference_code:
                         inference_code = block.strip()
 
-        # Pattern 3: If only one code block and it's the inference (solve body)
+        # Pattern 3: Fallback - strip markers before treating as inference
         if not inference_code and not training_code:
-            # Fall back to treating entire code as inference (backward compatibility)
-            inference_code = code.strip()
+            # Remove any CONFIG section before using as inference code
+            fallback = code
+            if config_json:
+                # Remove the config section we already extracted
+                fallback = re.sub(
+                    r'###\s*CONFIG\s*###\s*\n.*?(?=###|$)',
+                    '', code, count=1, flags=re.DOTALL | re.IGNORECASE,
+                ).strip()
+            inference_code = fallback.strip() if fallback.strip() else None
 
         return config_json, training_code, inference_code
 
@@ -590,7 +554,7 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
 
             # Check for weights file in weights_dir
             weights_path = None
-            for ext in [".npy", ".npz", ".json", ".pkl", ".pt", ".pth"]:
+            for ext in [".bin", ".npy", ".npz", ".json", ".pkl", ".pt", ".pth"]:
                 for wfile in self.weights_dir.glob(f"*{ext}"):
                     weights_path = wfile
                     logger.info(f"Found weights: {weights_path}")
@@ -600,7 +564,7 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
 
             # Also check workspace root for weights*
             if not weights_path:
-                for ext in [".npy", ".npz", ".json", ".pkl"]:
+                for ext in [".bin", ".npy", ".npz", ".json", ".pkl"]:
                     for wfile in self.workspace_dir.glob(f"weights*{ext}"):
                         weights_path = wfile
                         logger.info(f"Found weights in workspace: {weights_path}")
@@ -639,10 +603,6 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
         """
         start_time = time.time()
 
-        # Reset training state for each new execution
-        # Each code submission has its own training code
-        self.reset_training()
-
         # Parse the two-stage code (config, training, inference)
         config_json, training_code, inference_code = self._parse_two_stage_code(code)
 
@@ -652,36 +612,46 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
         build_output = []
         run_output = []
 
-        # Stage 1: Training (if training code present and not already completed)
-        if training_code and not self.training_completed:
-            build_output.append("=== STAGE 1: TRAINING ===\n")
+        # Stage 1: Training (if training code present)
+        # Only re-train if the training code has changed since last run
+        if training_code:
+            training_hash = hashlib.sha256(training_code.encode()).hexdigest()
 
-            success, output, weights_path = self.execute_training(training_code)
-            build_output.append(output)
-
-            if not success:
-                result = ExecutionResult(
-                    build_success=False,
-                    run_success=False,
-                    output_generated=False,
-                    build_output=build_output,
-                    run_output=["Training failed - cannot proceed to inference"],
-                    total_time=time.time() - start_time,
-                    validation=None,
-                )
-                # Set error info for proper feedback
-                result.error_type = "TRAINING_ERROR"
-                result.error_message = self._extract_training_error(output)
-                return result
-
-            if weights_path:
-                self.trained_weights_path = weights_path
-                build_output.append(f"\nWeights saved to: {weights_path}")
+            if training_hash == self._last_training_hash and self.training_completed:
+                build_output.append("=== STAGE 1: TRAINING (cached - code unchanged) ===\n")
+                logger.info("Training code unchanged, reusing existing weights")
             else:
-                build_output.append("\nWarning: No weights file found after training")
+                # Training code changed (or first run) - reset and retrain
+                self.reset_training()
+                build_output.append("=== STAGE 1: TRAINING ===\n")
 
-            self.training_completed = True
-            build_output.append("\n=== Training completed ===\n")
+                success, output, weights_path = self.execute_training(training_code)
+                build_output.append(output)
+
+                if not success:
+                    result = ExecutionResult(
+                        build_success=False,
+                        run_success=False,
+                        output_generated=False,
+                        build_output=build_output,
+                        run_output=["Training failed - cannot proceed to inference"],
+                        total_time=time.time() - start_time,
+                        validation=None,
+                    )
+                    # Set error info for proper feedback
+                    result.error_type = "TRAINING_ERROR"
+                    result.error_message = self._extract_training_error(output)
+                    return result
+
+                if weights_path:
+                    self.trained_weights_path = weights_path
+                    build_output.append(f"\nWeights saved to: {weights_path}")
+                else:
+                    build_output.append("\nWarning: No weights file found after training")
+
+                self.training_completed = True
+                self._last_training_hash = training_hash
+                build_output.append("\n=== Training completed ===\n")
 
         # Stage 2: Inference
         if not inference_code:
@@ -711,7 +681,15 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
         if self._pending_config_json:
             full_inference_code = f"### CONFIG ###\n{self._pending_config_json}\n\n### CODE ###\n{inference_code}"
         else:
-            full_inference_code = inference_code
+            # No config provided by agent - use template's existing config.json as fallback
+            # This prevents WhiteBoxInterpreter.execute() from rejecting the code
+            # with FORMAT_ERROR due to missing ### CONFIG ### section
+            fallback_config = self._read_template_config()
+            if fallback_config:
+                full_inference_code = f"### CONFIG ###\n{fallback_config}\n\n### CODE ###\n{inference_code}"
+            else:
+                # No template config either - use minimal empty config
+                full_inference_code = f"### CONFIG ###\n{{}}\n\n### CODE ###\n{inference_code}"
         inference_result = super().execute(full_inference_code, testcase_path)
 
         # Combine results
@@ -815,7 +793,16 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
 
         # Pattern 1: def solve(...): with placeholder body
         # Match the entire solve function and replace its body
-        pattern = r'(def\s+solve\s*\([^)]*\)\s*:)\s*\n(\s+)(?:# put your solution here\n\s+output = Ciphertext\(\)\n\s+return output|pass|\.\.\.)'
+        # Handles: pass, ..., raise NotImplementedError, # put your solution here + return
+        placeholder = (
+            r'(?:'
+            r'# put your solution here\n\s+output = Ciphertext\(\)\n\s+return output'
+            r'|pass'
+            r'|\.\.\.'
+            r'|raise\s+NotImplementedError[^\n]*'
+            r')'
+        )
+        pattern = rf'(def\s+solve\s*\([^)]*\)\s*:)\s*\n(\s+){placeholder}'
         match = re.search(pattern, template)
         if match:
             indent = match.group(2)
@@ -826,7 +813,34 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
             solution_file.write_text(new_content)
             return
 
-        # Pattern 2: Just replace placeholder comment
+        # Pattern 2: def solve(...): with ANY single-expression body (generic)
+        # Replace the entire body of the existing solve function
+        solve_match = re.search(r'(def\s+solve\s*\([^)]*\)\s*:)\s*\n', template)
+        if solve_match:
+            # Find the extent of the function body by indentation
+            func_start = solve_match.end()
+            lines = template[func_start:].split('\n')
+            body_end = func_start
+            base_indent = None
+            for line in lines:
+                if line.strip():
+                    line_indent = len(line) - len(line.lstrip())
+                    if base_indent is None:
+                        base_indent = line_indent
+                    elif line_indent < base_indent:
+                        # Dedented line — end of function body
+                        break
+                body_end += len(line) + 1  # +1 for newline
+
+            if base_indent is not None:
+                indent = ' ' * base_indent
+                indented_code = "\n".join(indent + line if line.strip() else line
+                                           for line in solve_body.split("\n"))
+                new_content = template[:solve_match.start()] + solve_match.group(1) + "\n" + indented_code + "\n" + template[body_end:]
+                solution_file.write_text(new_content)
+                return
+
+        # Pattern 3: Just replace placeholder comment
         pattern = r'#\s*put your solution here.*?return output'
         if re.search(pattern, template, re.DOTALL):
             new_content = re.sub(pattern, solve_body, template, flags=re.DOTALL)
@@ -834,6 +848,7 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
             return
 
         # Fallback: append (this is for Python only since we're in _inject_python_code)
+        logger.warning("Could not find Python injection point, appending code")
         with open(solution_file, 'a') as f:
             f.write("\n# Agent-generated code\n")
             f.write(solve_body)
@@ -874,8 +889,25 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
             solution_file.write_text(new_content)
             return
 
-        # Fallback: just inject into empty eval
-        logger.warning("Could not find C++ injection point, using fallback")
+        # Pattern 4: Find eval() and replace body using brace matching
+        eval_match = re.search(r'void\s+\w+::eval\s*\(\s*\)\s*\{', template)
+        if eval_match:
+            start = eval_match.end()
+            depth = 1
+            pos = start
+            while pos < len(template) and depth > 0:
+                if template[pos] == '{':
+                    depth += 1
+                elif template[pos] == '}':
+                    depth -= 1
+                pos += 1
+            if depth == 0:
+                new_content = template[:start] + '\n' + eval_body + '\n' + template[pos - 1:]
+                solution_file.write_text(new_content)
+                return
+
+        # Fallback: could not find eval() at all
+        logger.warning("Could not find C++ eval() injection point, writing template unchanged")
         solution_file.write_text(template)
 
     def _strip_code_markers(self, code: str) -> str:
@@ -895,13 +927,36 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
             filtered.append(line)
         return '\n'.join(filtered)
 
+    def _split_weights_and_body(self, code: str) -> Tuple[str, str]:
+        """Split code into module-level weight declarations and solve body.
+
+        If the code contains a `def solve` definition, everything before it
+        is treated as weight declarations (to be inserted at module scope)
+        and the def solve block onwards is the body.
+
+        Returns:
+            (weight_declarations, solve_body)
+        """
+        match = re.search(r'^(def\s+solve\s*\([^)]*\)\s*:)', code, re.MULTILINE)
+        if match:
+            before = code[:match.start()].strip()
+            from_def = code[match.start():]
+            return before, from_def
+        return "", code
+
     def _extract_solve_body(self, code: str) -> str:
         """Extract the body from a def solve(): definition if present."""
-        # Pattern: def solve(...):
-        match = re.search(r'^def\s+solve\s*\([^)]*\)\s*:\s*$', code, re.MULTILINE)
+        # Pattern: def solve(...): with optional trailing comment
+        match = re.search(r'^def\s+solve\s*\([^)]*\)\s*:', code, re.MULTILINE)
         if match:
             # Find the function body (everything after the def line, dedented)
             after_def = code[match.end():]
+            # Skip remainder of the def line (e.g., trailing comment)
+            first_newline = after_def.find('\n')
+            if first_newline != -1:
+                after_def = after_def[first_newline + 1:]
+            else:
+                return code  # No body after def line
             lines = after_def.split('\n')
 
             # Find the base indentation
@@ -920,7 +975,10 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
                 else:
                     body_lines.append('')
 
-            return '\n'.join(body_lines).strip()
+            body = '\n'.join(body_lines).strip()
+            if body:
+                return body
+            # Empty body after stripping — fall through to return original
 
         return code
 
@@ -959,24 +1017,34 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
                 logger.debug(f"Stripped void eval() wrapper, body length: {len(body)}")
                 return body
 
-        # Pattern 2: Just { ... } wrapper (already stripped the void eval part)
-        if code.startswith('{') and code.endswith('}'):
-            # Check if it's a simple wrapper (only one top-level brace pair)
+        # Pattern 2: Just { ... } wrapper (possibly with leading comments)
+        # Strip leading single-line comments to find the actual { start
+        stripped = code
+        lines = code.split('\n')
+        first_code_line = 0
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if s and not s.startswith('//'):
+                first_code_line = i
+                break
+        if first_code_line > 0:
+            stripped = '\n'.join(lines[first_code_line:])
+
+        if stripped.strip().startswith('{') and stripped.strip().endswith('}'):
+            inner = stripped.strip()
             depth = 0
             is_wrapper = True
-            for i, ch in enumerate(code):
+            for i, ch in enumerate(inner):
                 if ch == '{':
                     depth += 1
                 elif ch == '}':
                     depth -= 1
-                    if depth == 0 and i < len(code) - 1:
-                        # Found a closing brace before the end - not a simple wrapper
+                    if depth == 0 and i < len(inner) - 1:
                         is_wrapper = False
                         break
 
             if is_wrapper and depth == 0:
-                # Strip outer braces
-                body = code[1:-1].strip()
+                body = inner[1:-1].strip()
                 logger.debug(f"Stripped outer braces wrapper, body length: {len(body)}")
                 return body
 
@@ -1000,11 +1068,27 @@ print(f"X_train: {{X_train.shape}}, y_train: {{y_train.shape}}")
         """Reset training state for a fresh attempt."""
         self.training_completed = False
         self.trained_weights_path = None
+        self._last_training_hash = None
 
         # Clear weights directory
         if self.weights_dir.exists():
             shutil.rmtree(self.weights_dir, ignore_errors=True)
         self.weights_dir.mkdir(parents=True, exist_ok=True)
+
+    def _read_template_config(self) -> Optional[str]:
+        """Read config.json from the challenge template directory as fallback."""
+        if self.spec.template_dir and self.spec.template_dir.exists():
+            config_path = self.spec.template_dir / "config.json"
+            if config_path.exists():
+                try:
+                    content = config_path.read_text().strip()
+                    # Validate it's valid JSON
+                    json.loads(content)
+                    logger.info("Using template config.json as fallback")
+                    return content
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning(f"Failed to read template config.json: {e}")
+        return None
 
     def _extract_training_error(self, output: str) -> str:
         """Extract meaningful error message from training output."""

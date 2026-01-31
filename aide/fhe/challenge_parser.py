@@ -412,35 +412,67 @@ def _parse_task(text: str, spec: FHEChallengeSpec) -> None:
             spec.task_description = intro_match.group(1).strip()[:1000]
         return
 
-    # Map patterns to task names and function signatures
-    task_patterns = [
-        (r'relu|max\s*\(\s*0', "relu", "max(0, x)"),
-        (r'sigmoid', "sigmoid", "1/(1+exp(-x))"),
-        (r'sign\s*\(|sign\s+function', "sign", "sign(x)"),
-        (r'gelu', "gelu", "gelu(x)"),
-        (r'softmax', "softmax", "softmax(x)"),
-        (r'tanh', "tanh", "tanh(x)"),
-        (r'matrix\s+mult|matmul', "matrix_multiplication", "A @ B"),
-        (r'sort|sorting', "sorting", "sort(x)"),
-        (r'max|maximum', "max", "max(x)"),
-        (r'knn|nearest\s+neighbor', "knn", "knn(x, k)"),
-        (r'lookup|table', "lookup_table", "table[idx]"),
-        (r'shift\s+left|shl', "shl", "x << n"),
-        (r'parity', "parity", "parity(x)"),
-        (r'invertible|inverse', "invertible_matrix", "det(A) != 0"),
-        (r'svd|singular\s+value', "svd", "svd(A)"),
-        (r'string\s+search|substring', "string_search", "find(str, text)"),
+    # STEP 1: Try matching the challenge TITLE (first heading) — most reliable
+    # Title patterns are checked against the first heading only
+    title = (spec.challenge_name or "").lower()
+
+    title_task_map = [
+        (r'\bgelu\b', "gelu", "gelu(x)"),
+        (r'\brelu\b', "relu", "max(0, x)"),
+        (r'\bsoftmax\b', "softmax", "softmax(x)"),
+        (r'\bsigmoid\b|logistic', "sigmoid", "1/(1+exp(-x))"),
+        (r'\bsign\b', "sign", "sign(x)"),
+        (r'\btanh\b', "tanh", "tanh(x)"),
+        (r'singular\s+value|svd', "svd", "svd(A)"),
+        (r'invertible\s+matrix', "invertible_matrix", "det(A) != 0"),
+        (r'matrix\s+mult', "matrix_multiplication", "A @ B"),
+        (r'array\s+sort', "array_sorting", "sort(x)"),
+        (r'max\s+element', "max", "max(x)"),
+        (r'k-?nearest|knn', "knn", "knn(x, k)"),
+        (r'lookup\s+table', "lookup_table", "table[idx]"),
+        (r'\bshl\b|shift\s+left', "shl", "x << n"),
+        (r'\bparity\b', "parity", "parity(x)"),
+        (r'string\s+search', "string_search", "find(str, text)"),
         (r'set\s+membership', "set_membership", "x in S"),
     ]
 
-    for pattern, task, signature in task_patterns:
-        if re.search(pattern, text_lower):
+    for pattern, task, signature in title_task_map:
+        if re.search(pattern, title):
             spec.task = task
             spec.function_signature = signature
             break
     else:
-        spec.task = "custom"
-        spec.function_signature = "f(x)"
+        # STEP 2: Fall back to content patterns (more specific first, broad last)
+        task_patterns = [
+            # Very specific patterns first
+            (r'\bgelu\b', "gelu", "gelu(x)"),
+            (r'\bsoftmax\b', "softmax", "softmax(x)"),
+            (r'singular\s+value\s+decomposition|\bsvd\b', "svd", "svd(A)"),
+            (r'\bshl\b|shift\s+left', "shl", "x << n"),
+            (r'\bparity\b', "parity", "parity(x)"),
+            (r'invertible\s+matrix|matrix\s+inver', "invertible_matrix", "det(A) != 0"),
+            # Then standard patterns with word boundaries
+            (r'\brelu\b|max\s*\(\s*0', "relu", "max(0, x)"),
+            (r'\bsigmoid\b|logistic\s+function', "sigmoid", "1/(1+exp(-x))"),
+            (r'sign\s*\(|sign\s+function|sign\s+evaluation', "sign", "sign(x)"),
+            (r'\btanh\b', "tanh", "tanh(x)"),
+            (r'matrix\s+mult|matmul', "matrix_multiplication", "A @ B"),
+            (r'array\s+sort|sorting\s+algorithm', "array_sorting", "sort(x)"),
+            (r'max\s+element|maximum\s+element', "max", "max(x)"),
+            (r'knn|k-?nearest\s+neighbor', "knn", "knn(x, k)"),
+            (r'lookup\s+table', "lookup_table", "table[idx]"),
+            (r'string\s+search|substring', "string_search", "find(str, text)"),
+            (r'set\s+membership', "set_membership", "x in S"),
+        ]
+
+        for pattern, task, signature in task_patterns:
+            if re.search(pattern, text_lower):
+                spec.task = task
+                spec.function_signature = signature
+                break
+        else:
+            spec.task = "custom"
+            spec.function_signature = "f(x)"
 
     # Extract task description from Introduction section
     intro_match = re.search(
