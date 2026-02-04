@@ -168,3 +168,6 @@ logs
 
 .gradio/
 .ruff_cache/
+
+# FHE Challenge
+fhe_challenge

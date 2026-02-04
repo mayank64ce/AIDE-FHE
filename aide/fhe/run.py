@@ -19,6 +19,9 @@ Architecture:
     6. Agent iterates based on feedback
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import atexit
 import logging
 import shutil
