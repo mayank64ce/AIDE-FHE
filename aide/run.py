@@ -26,6 +26,9 @@ from rich.status import Status
 from rich.tree import Tree
 from .utils.config import load_task_desc, prep_agent_workspace, save_run, load_cfg
 
+from dotenv import load_dotenv
+load_dotenv()
+
 logger = logging.getLogger("aide")
 
 
