@@ -962,13 +962,16 @@ y_train = df["label"].values'''
             return {
                 "Response Format": (
                     "Provide your implementation in this format:\n\n"
-                    "1. Brief explanation of your approach (2-3 sentences)\n\n"
+                    "1. Your approach:\n"
+                    "### PLAN ###\n"
+                    "Brief explanation of your approach (2-3 sentences)\n\n"
                     "2. The eval() function body:\n"
                     "```cpp\n"
                     "// Your implementation here\n"
                     "// Do NOT include function signature or braces\n"
                     "```\n\n"
-                    "IMPORTANT: Only provide the code that goes INSIDE eval(), "
+                    "IMPORTANT: Both the ### PLAN ### section and the code block are required. "
+                    "Only provide the code that goes INSIDE eval(), "
                     "not the function signature or surrounding code."
                 )
             }
@@ -976,16 +979,25 @@ y_train = df["label"].values'''
         elif spec.challenge_type == ChallengeType.WHITE_BOX_OPENFHE:
             return {
                 "Response Format": (
-                    "Provide BOTH sections (config.json controls crypto parameters):\n\n"
+                    "Provide your implementation in this format:\n\n"
+                    "1. Your approach:\n"
+                    "### PLAN ###\n"
+                    "Brief explanation of your approach (2-3 sentences)\n\n"
+                    "2. Crypto parameters:\n"
+                    "```json\n"
                     "### CONFIG ###\n"
                     "{\n"
                     '  "mult_depth": 20,\n'
                     '  "indexes_for_rotation_key": [1, 2, 4],\n'
                     '  "scheme": "CKKS"\n'
-                    "}\n\n"
+                    "}\n"
+                    "```\n\n"
+                    "3. Implementation:\n"
+                    "```cpp\n"
                     "### CODE ###\n"
-                    "// Your eval() function body here\n\n"
-                    "IMPORTANT: Both sections are required for white-box challenges."
+                    "// Your eval() function body here\n"
+                    "```\n\n"
+                    "IMPORTANT: All three sections are required."
                 )
             }
 
@@ -1066,8 +1078,16 @@ y_train = df["label"].values'''
         # Extract code from response
         code = self._extract_code(response)
 
-        # Extract explanation (text before code)
-        plan = response.split("```")[0].strip() if "```" in response else ""
+        # Extract explanation: prefer ### PLAN ### marker, fallback to text before first code block
+        if "### PLAN ###" in response:
+            plan = response.split("### PLAN ###")[1].split("```")[0].strip()
+        else:
+            plan = response.split("```")[0].strip() if "```" in response else ""
+        # Strip any stray markers that are not real plan text
+        for marker in ["### CONFIG ###", "### CODE ###", "### PLAN ###"]:
+            plan = plan.replace(marker, "").strip()
+        if len(plan) < 10:
+            plan = ""
 
         return plan, code
 
